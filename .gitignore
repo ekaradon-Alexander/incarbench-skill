@@ -13,6 +13,7 @@ config/hard_llm.json
 config/llm_connectivity_test_temperature_zero.json
 cookies.txt
 web-secure-ca.crt
+.env
 
 # Local logs and background runs
 logs/

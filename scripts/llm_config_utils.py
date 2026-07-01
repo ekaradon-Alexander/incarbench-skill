@@ -8,7 +8,9 @@ from benchmark_utils import load_json
 
 
 def default_config_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "config" / "llm_benchmark_config.json"
+    return (
+        Path(__file__).resolve().parent.parent / "config" / "llm_benchmark_config.json"
+    )
 
 
 def load_llm_benchmark_config(path: Path | None = None) -> dict[str, Any]:
@@ -18,7 +20,9 @@ def load_llm_benchmark_config(path: Path | None = None) -> dict[str, Any]:
     return payload
 
 
-def validate_llm_benchmark_config(payload: dict[str, Any], config_path: Path | None = None) -> None:
+def validate_llm_benchmark_config(
+    payload: dict[str, Any], config_path: Path | None = None
+) -> None:
     def fail(message: str) -> None:
         prefix = f"{config_path}: " if config_path else ""
         raise ValueError(prefix + message)
@@ -31,7 +35,9 @@ def validate_llm_benchmark_config(payload: dict[str, Any], config_path: Path | N
         fail("materials_project must be an object")
 
     if "api_key_env" in materials_project or "use_env_first" in materials_project:
-        fail("materials_project must not define environment-variable-based key settings")
+        fail(
+            "materials_project must not define environment-variable-based key settings"
+        )
 
     for required_key in ("api_key", "endpoint"):
         if required_key not in materials_project:
@@ -41,9 +47,20 @@ def validate_llm_benchmark_config(payload: dict[str, Any], config_path: Path | N
     if not isinstance(benchmark, dict):
         fail("benchmark must be an object")
 
-    for required_key in ("static_benchmark_root", "dataset_root", "default_prompt_style"):
+    for required_key in (
+        "static_benchmark_root",
+        "dataset_root",
+        "default_prompt_style",
+    ):
         if required_key not in benchmark:
             fail(f"benchmark.{required_key} is required")
+
+    with_skills = payload.get("with_skills", [])
+    if not isinstance(with_skills, list):
+        fail("with_skills must be a list when provided")
+    for index, skill_name in enumerate(with_skills):
+        if not isinstance(skill_name, str) or not skill_name.strip():
+            fail(f"with_skills[{index}] must be a non-empty string")
 
     models = payload.get("models")
     if not isinstance(models, list) or not models:
@@ -58,7 +75,13 @@ def validate_llm_benchmark_config(payload: dict[str, Any], config_path: Path | N
             if forbidden_key in model:
                 fail(f"models[{index}] must not define {forbidden_key}")
 
-        for required_key in ("name", "enabled", "provider", "access_method", "model_id"):
+        for required_key in (
+            "name",
+            "enabled",
+            "provider",
+            "access_method",
+            "model_id",
+        ):
             if required_key not in model:
                 fail(f"models[{index}].{required_key} is required")
 
@@ -90,7 +113,9 @@ def validate_llm_benchmark_config(payload: dict[str, Any], config_path: Path | N
             for required_key in ("endpoint", "region", "project_id"):
                 value = model.get(required_key)
                 if not isinstance(value, str) or not value.strip():
-                    fail(f"models[{index}].{required_key} is required when access_method=third_party_via_vertex")
+                    fail(
+                        f"models[{index}].{required_key} is required when access_method=third_party_via_vertex"
+                    )
             if "api_key" in model and not isinstance(model.get("api_key"), str):
                 fail(f"models[{index}].api_key must be a string when provided")
             if "base_url" in model and not isinstance(model.get("base_url"), str):
@@ -98,7 +123,11 @@ def validate_llm_benchmark_config(payload: dict[str, Any], config_path: Path | N
             continue
 
         if vertexai:
-            if model.get("access_method") not in {"openai_sdk", "openai_compatible_http", "google_genai_sdk"}:
+            if model.get("access_method") not in {
+                "openai_sdk",
+                "openai_compatible_http",
+                "google_genai_sdk",
+            }:
                 fail(
                     f"models[{index}] with vertexai=true must use access_method openai_sdk, openai_compatible_http, or google_genai_sdk"
                 )
@@ -106,11 +135,17 @@ def validate_llm_benchmark_config(payload: dict[str, Any], config_path: Path | N
                 for required_key in ("project", "location"):
                     value = model.get(required_key)
                     if not isinstance(value, str) or not value.strip():
-                        fail(f"models[{index}].{required_key} is required when vertexai=true and access_method is OpenAI-compatible")
+                        fail(
+                            f"models[{index}].{required_key} is required when vertexai=true and access_method is OpenAI-compatible"
+                        )
             else:
                 for optional_key in ("project", "location"):
-                    if optional_key in model and not isinstance(model.get(optional_key), str):
-                        fail(f"models[{index}].{optional_key} must be a string when provided")
+                    if optional_key in model and not isinstance(
+                        model.get(optional_key), str
+                    ):
+                        fail(
+                            f"models[{index}].{optional_key} must be a string when provided"
+                        )
             if "api_key" in model and not isinstance(model.get("api_key"), str):
                 fail(f"models[{index}].api_key must be a string when provided")
             if "base_url" in model and not isinstance(model.get("base_url"), str):
@@ -122,4 +157,8 @@ def validate_llm_benchmark_config(payload: dict[str, Any], config_path: Path | N
                     fail(f"models[{index}].{required_key} is required")
 
 
-__all__ = ["default_config_path", "load_llm_benchmark_config", "validate_llm_benchmark_config"]
+__all__ = [
+    "default_config_path",
+    "load_llm_benchmark_config",
+    "validate_llm_benchmark_config",
+]

@@ -1,3 +1,17 @@
+# INCARBench-skill
+
+[Skills](https://support.claude.com/en/articles/12512176-what-are-skills) or [skill-like structured documentations](https://docs.langchain.com/oss/python/langchain/multi-agent/skills) provide on-demand augmentations for agents, reduce agents' hallucinations, and finally lead to a higher-quality generation result.
+
+Various skills have been published for VASP preparation, simulation and post-processing. Most of these skills provide guidelines for INCAR file generation. Benchmarking skills together with models is significant for creating better VASP agents.
+
+This repository implements the following modifications based on `INCARBench`:
+
+1. All the LLMs are invoked through the LangChain deepagents API, which keeps model access on one interface while still allowing skill-oriented extensions.
+
+---
+
+> Raw README.md content from upper-stream repo.
+
 # INCARBench
 
 INCARBench is a benchmark for evaluating large language models on scientific

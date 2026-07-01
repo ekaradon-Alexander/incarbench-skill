@@ -1,0 +1,29 @@
+{
+  "version": "0.1",
+  "skills": [
+    {
+      "name": "vasp.skill",
+      "author": "jkitchin",
+      "source_type": "github",
+      "github_repo": "https://github.com/jkitchin/skillz",
+      "github_branch": "main",
+      "github_path": "skills/programming/vasp"
+    },
+    {
+      "name": "vasp-workflows",
+      "author": "quanshengwu",
+      "source_type": "github",
+      "github_repo": "https://github.com/chatmaterials/vasp-workflows",
+      "github_branch": "main",
+      "github_path": "."
+    },
+    {
+      "name": "HPC-Skills-vasp",
+      "author": "SciMate-AI",
+      "source_type": "github",
+      "github_repo": "https://github.com/SciMate-AI/HPC-Skills/",
+      "github_branch": "main",
+      "github_path": "skills/hpc-vasp"
+    }
+  ]
+}

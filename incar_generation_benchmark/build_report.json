@@ -1,9 +1,8 @@
 {
-  "generated_at_utc": "2026-04-06T03:19:12Z",
-  "benchmark_root": "/sdh/lzy/vasp_benchmark/incar_generation_benchmark",
+  "generated_at_utc": "2026-07-01T03:33:03Z",
+  "benchmark_root": "/Users/alexander/Workspace/incarbench-skill/incar_generation_benchmark",
   "total_cases": 192,
-  "built_cases": [],
-  "synced_cases": [
+  "built_cases": [
     "P01_Si_Static_SCF",
     "P02_GaAs_Line_Mode_Bands",
     "P03_Fe_Static_Magnetic",
@@ -197,17 +196,18 @@
     "P302_GaAs_Static_SCF",
     "P303_GaAs_Geometry_Relax"
   ],
+  "synced_cases": [],
   "skipped_cases": [],
   "failed_cases": [],
   "counts": {
-    "built": 0,
-    "synced": 192,
+    "built": 192,
+    "synced": 0,
     "skipped": 0,
     "failed": 0
   },
   "resume_enabled": true,
   "overwrite": false,
   "fail_fast": false,
-  "sync_existing_definitions": true,
-  "rescored_existing_outputs": true
+  "sync_existing_definitions": false,
+  "rescored_existing_outputs": false
 }

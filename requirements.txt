@@ -1,7 +1,13 @@
+deepagents
+langchain
+langchain-anthropic
+langchain-google-genai
+langchain-openai
 openai
 anthropic
-httpx
+httpx[socks]
 google-genai
 mp-api
 pymatgen
 requests
+dotenv

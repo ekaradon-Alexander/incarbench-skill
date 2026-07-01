@@ -5,13 +5,16 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib import error, request
 
 from benchmark_utils import dump_json, load_json, utc_now
@@ -20,6 +23,7 @@ from llm_config_utils import load_llm_benchmark_config
 CSV_LIST_SEPARATOR = "|"
 IGNORED_SCORE_KEYS = {"SYSTEM"}
 DEFAULT_OUTPUT_ROOT = Path("incar_generation_benchmark")
+DEFAULT_SKILL_ROOT = Path("skills")
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 UNSET = "__UNSET__"
@@ -30,6 +34,21 @@ MP_RETRY_DELAY_SECONDS = 3
 MP_MAX_RETRY_DELAY_SECONDS = 30
 DEFAULT_LOCAL_PROXY_URL = "http://127.0.0.1:7890"
 GCLOUD_TOKEN_TTL_SECONDS = 3000
+DEEPAGENTS_PROFILE_PROVIDER_KEYS = ("openai", "anthropic", "google_genai")
+DEEPAGENTS_EXCLUDED_TOOLS = frozenset(
+    {
+        "write_todos",
+        "ls",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "execute",
+        "eval",
+        "task",
+    }
+)
 ENUM_NORMALIZATION = {
     "PREC": {
         "LOW": "Low",
@@ -250,7 +269,9 @@ def is_ismear_policy_consistent(expected: str | None, observed: str | None) -> b
     return observed_value <= 0
 
 
-def runnable_policy_matches(key: str, reference_params: dict[str, str], candidate_params: dict[str, str]) -> bool:
+def runnable_policy_matches(
+    key: str, reference_params: dict[str, str], candidate_params: dict[str, str]
+) -> bool:
     expected = reference_params.get(key)
     observed = candidate_params.get(key)
     if key == "ISMEAR":
@@ -268,7 +289,9 @@ def _task_workflow_pass(task_type: str, candidate_params: dict[str, str]) -> boo
     return not _task_workflow_failure_reasons(task_type, candidate_params)
 
 
-def _task_workflow_failure_reasons(task_type: str, candidate_params: dict[str, str]) -> list[str]:
+def _task_workflow_failure_reasons(
+    task_type: str, candidate_params: dict[str, str]
+) -> list[str]:
     ibrion = _integer_value(candidate_params.get("IBRION"))
     nsw = _integer_value(candidate_params.get("NSW"))
     icharg = _integer_value(candidate_params.get("ICHARG"))
@@ -308,15 +331,21 @@ def minimum_task_runnable_assessment(
     task_type = str(metadata.get("task_type") or "")
     reasons = _task_workflow_failure_reasons(task_type, candidate_params)
 
-    semantic_keys = [canonicalize_key(key) for key in scoring.get("semantic_must_match_keys", [])]
-    policy_keys = [canonicalize_key(key) for key in scoring.get("policy_match_keys", [])]
+    semantic_keys = [
+        canonicalize_key(key) for key in scoring.get("semantic_must_match_keys", [])
+    ]
+    policy_keys = [
+        canonicalize_key(key) for key in scoring.get("policy_match_keys", [])
+    ]
 
     for key in semantic_keys:
         if reference_params.get(key) != candidate_params.get(key):
             reasons.append(f"semantic:{key}")
 
     for key in policy_keys:
-        if _is_runnable_policy_key(key, reference_params) and not runnable_policy_matches(key, reference_params, candidate_params):
+        if _is_runnable_policy_key(
+            key, reference_params
+        ) and not runnable_policy_matches(key, reference_params, candidate_params):
             reasons.append(f"policy:{key}")
 
     deduped = list(dict.fromkeys(reasons))
@@ -391,6 +420,7 @@ def parse_incar_text(text: str) -> dict[str, str]:
 def parse_incar_file(path: Path) -> dict[str, str]:
     return parse_incar_text(path.read_text(encoding="utf-8"))
 
+
 NORMALIZATION_PROFILES: dict[str, dict[str, Any]] = {
     "static_default": {
         "keep": STATIC_DEFAULT_KEYS,
@@ -451,7 +481,9 @@ def row_mentioned_scoring_keys(row: dict[str, str]) -> set[str]:
         "optional_match_keys",
         "must_match_keys",
     ):
-        mentioned |= {canonicalize_key(value) for value in split_csv_list(row.get(field))}
+        mentioned |= {
+            canonicalize_key(value) for value in split_csv_list(row.get(field))
+        }
     return mentioned
 
 
@@ -462,7 +494,9 @@ def mentioned_scoring_keys_union(rows: list[dict[str, str]]) -> set[str]:
     return mentioned
 
 
-DEFAULTS_DOC_PATH = REPO_ROOT / "docs" / "experimental" / "vasp_incar_defaults_from_wiki.md"
+DEFAULTS_DOC_PATH = (
+    REPO_ROOT / "docs" / "experimental" / "vasp_incar_defaults_from_wiki.md"
+)
 
 
 @lru_cache(maxsize=1)
@@ -495,7 +529,11 @@ def _clean_default_text(text: str) -> str:
 
 def _extract_simple_default_value(text: str) -> str | None:
     cleaned = _clean_default_text(text)
-    if " if " in cleaned.lower() or " else" in cleaned.lower() or " for " in cleaned.lower():
+    if (
+        " if " in cleaned.lower()
+        or " else" in cleaned.lower()
+        or " for " in cleaned.lower()
+    ):
         return None
     if "=" not in cleaned:
         return None
@@ -525,8 +563,13 @@ def resolve_candidate_default_value(
 
     if key == "ENCUT":
         for fallback_key in ("ENMAX", "ENINI", "ENCUTGW"):
-            if fallback_key in raw_seed_params and raw_seed_params[fallback_key] is not None:
-                return canonicalize_value(format_incar_value(raw_seed_params[fallback_key]))
+            if (
+                fallback_key in raw_seed_params
+                and raw_seed_params[fallback_key] is not None
+            ):
+                return canonicalize_value(
+                    format_incar_value(raw_seed_params[fallback_key])
+                )
         return None
 
     if key == "EDIFFG":
@@ -692,17 +735,23 @@ def normalize_incar_dict(
     for canonical_key, formatted_value in canonical_raw.items():
         if keep_keys and canonical_key not in keep_keys:
             continue
-        normalized[canonical_key] = normalize_value_for_key(canonical_key, formatted_value)
+        normalized[canonical_key] = normalize_value_for_key(
+            canonical_key, formatted_value
+        )
 
     if "ENCUT" in keep_keys and "ENCUT" not in normalized:
         for fallback_key in ("ENMAX", "ENINI", "ENCUTGW"):
             if fallback_key in canonical_raw:
-                normalized["ENCUT"] = normalize_value_for_key("ENCUT", canonical_raw[fallback_key])
+                normalized["ENCUT"] = normalize_value_for_key(
+                    "ENCUT", canonical_raw[fallback_key]
+                )
                 break
 
     if "EDIFF" in keep_keys and "EDIFF" not in normalized:
         if "EDIFF" in canonical_raw:
-            normalized["EDIFF"] = normalize_value_for_key("EDIFF", canonical_raw["EDIFF"])
+            normalized["EDIFF"] = normalize_value_for_key(
+                "EDIFF", canonical_raw["EDIFF"]
+            )
 
     if "NELM" in keep_keys and "NELM" not in normalized and "NELM" in canonical_raw:
         normalized["NELM"] = normalize_value_for_key("NELM", canonical_raw["NELM"])
@@ -752,7 +801,9 @@ def choose_task_id(
 
     patterns = [token.lower() for token in split_csv_list(calc_type_pattern)]
     if not patterns:
-        raise ValueError("calc_type_pattern must not be empty when preferred_task_id is absent")
+        raise ValueError(
+            "calc_type_pattern must not be empty when preferred_task_id is absent"
+        )
 
     for task_id, calc_type in calc_types.items():
         calc_type_text = str(calc_type).lower()
@@ -792,13 +843,17 @@ def build_case_metadata(
         "reference_source": source_reference,
         "reference_adjustments": {
             "reference_remove_keys": split_csv_list(row.get("reference_remove_keys")),
-            "reference_overrides": parse_key_value_overrides(row.get("reference_overrides")),
+            "reference_overrides": parse_key_value_overrides(
+                row.get("reference_overrides")
+            ),
         },
         "notes": row.get("notes", ""),
     }
 
 
-def build_scoring_payload(row: dict[str, str], reference_params: dict[str, str]) -> dict[str, Any]:
+def build_scoring_payload(
+    row: dict[str, str], reference_params: dict[str, str]
+) -> dict[str, Any]:
     semantic_must_match = [
         canonicalize_key(value)
         for value in split_csv_list(row.get("semantic_must_match_keys"))
@@ -808,14 +863,19 @@ def build_scoring_payload(row: dict[str, str], reference_params: dict[str, str])
         for value in split_csv_list(row.get("policy_match_keys"))
     ]
     legacy_must_match = [
-        canonicalize_key(value)
-        for value in split_csv_list(row.get("must_match_keys"))
+        canonicalize_key(value) for value in split_csv_list(row.get("must_match_keys"))
     ]
-    optional_match = [canonicalize_key(value) for value in split_csv_list(row.get("optional_match_keys"))]
+    optional_match = [
+        canonicalize_key(value)
+        for value in split_csv_list(row.get("optional_match_keys"))
+    ]
     ignore_keys = {
         canonicalize_key(value) for value in split_csv_list(row.get("ignore_keys"))
     } | IGNORED_SCORE_KEYS
-    allowed_extra = {canonicalize_key(value) for value in split_csv_list(row.get("allowed_extra_keys"))}
+    allowed_extra = {
+        canonicalize_key(value)
+        for value in split_csv_list(row.get("allowed_extra_keys"))
+    }
     policy_rule_overrides = {
         canonicalize_key(key): value
         for key, value in parse_json_object(row.get("policy_match_rules_json")).items()
@@ -829,7 +889,9 @@ def build_scoring_payload(row: dict[str, str], reference_params: dict[str, str])
                 semantic_must_match.append(key)
 
     policy_match_rules = {
-        key: policy_rule_overrides.get(key, DEFAULT_POLICY_RULES.get(key, {"type": "exact"}))
+        key: policy_rule_overrides.get(
+            key, DEFAULT_POLICY_RULES.get(key, {"type": "exact"})
+        )
         for key in policy_match
     }
 
@@ -847,6 +909,56 @@ def ensure_output_root(path: Path) -> Path:
     if path.is_absolute():
         return path
     return (REPO_ROOT / path).resolve()
+
+
+def ensure_skill_root(path: Path) -> Path:
+    if path.is_absolute():
+        return path.resolve()
+    return (REPO_ROOT / path).resolve()
+
+
+def configured_skill_names(config_path: Path | None = None) -> list[str]:
+    config = load_llm_benchmark_config(config_path)
+    return [str(skill_name) for skill_name in config.get("with_skills", [])]
+
+
+def resolve_skill_paths(
+    *,
+    skill_dir: Path,
+    skill_names: list[str],
+) -> dict[str, Path]:
+    skill_root = ensure_skill_root(skill_dir)
+    resolved: dict[str, Path] = {}
+    missing: list[str] = []
+    for skill_name in skill_names:
+        skill_path = skill_root / skill_name
+        if not skill_path.exists():
+            missing.append(skill_name)
+            continue
+        resolved[skill_name] = skill_path
+
+    if missing:
+        raise FileNotFoundError(
+            f"Missing skill directories under {skill_root}: {', '.join(sorted(missing))}"
+        )
+
+    return resolved
+
+
+@contextmanager
+def materialize_deepagents_skill_source(
+    skill_paths: list[Path],
+) -> Iterator[tuple[Path, list[str]]]:
+    with tempfile.TemporaryDirectory(prefix="incarbench-skills-") as tmp_dir:
+        source_root = Path(tmp_dir)
+        for skill_path in skill_paths:
+            mounted_path = source_root / skill_path.name
+            try:
+                mounted_path.symlink_to(skill_path, target_is_directory=True)
+            except OSError:
+                shutil.copytree(skill_path, mounted_path)
+
+        yield source_root, [str(source_root)]
 
 
 def load_mp_client(api_key: str):
@@ -889,7 +1001,9 @@ def should_retry_mp_exception(exc: Exception) -> bool:
 
 
 def mp_retry_delay_seconds(attempt: int) -> int:
-    return min(MP_RETRY_DELAY_SECONDS * (2 ** max(attempt - 1, 0)), MP_MAX_RETRY_DELAY_SECONDS)
+    return min(
+        MP_RETRY_DELAY_SECONDS * (2 ** max(attempt - 1, 0)), MP_MAX_RETRY_DELAY_SECONDS
+    )
 
 
 def fetch_mp_seed_data(
@@ -918,12 +1032,18 @@ def fetch_mp_seed_data(
                     preferred_task_id=row.get("preferred_task_id") or None,
                     calc_type_pattern=row["calc_type_pattern"],
                 )
+                print(
+                    f"{row['case_id']}: selected_task_id={selected_task_id}",
+                    flush=True,
+                )
                 task_docs = mpr.materials.tasks.search(task_ids=[selected_task_id])
                 if not task_docs:
                     raise ValueError(f"MP task not found: {selected_task_id}")
                 task_doc = task_docs[0]
                 raw_params = dict(task_doc.input.parameters)
-                structure = getattr(task_doc.input, "structure", None) or material_doc.structure
+                structure = (
+                    getattr(task_doc.input, "structure", None) or material_doc.structure
+                )
 
             return {
                 "source_kind": "mp",
@@ -959,7 +1079,9 @@ def load_structure_from_local_file(path: Path):
     try:
         from pymatgen.core import Structure
     except ImportError as exc:
-        raise RuntimeError("pymatgen is required to read local structure files") from exc
+        raise RuntimeError(
+            "pymatgen is required to read local structure files"
+        ) from exc
 
     return Structure.from_file(path)
 
@@ -971,16 +1093,22 @@ def fetch_local_seed_data(
 ) -> dict[str, Any]:
     structure_path_raw = row.get("local_structure_path") or row.get("local_poscar_path")
     if not structure_path_raw:
-        raise ValueError(f"{row['case_id']}: local source requires local_structure_path or local_poscar_path")
+        raise ValueError(
+            f"{row['case_id']}: local source requires local_structure_path or local_poscar_path"
+        )
 
     structure_path = resolve_input_path(structure_path_raw, csv_path=csv_path)
     if not structure_path.exists():
-        raise FileNotFoundError(f"{row['case_id']}: local structure file not found: {structure_path}")
+        raise FileNotFoundError(
+            f"{row['case_id']}: local structure file not found: {structure_path}"
+        )
 
     incar_json_raw = row.get("local_incar_json_path", "")
     incar_text_raw = row.get("local_incar_path", "")
     if not incar_json_raw and not incar_text_raw:
-        raise ValueError(f"{row['case_id']}: local source requires local_incar_json_path or local_incar_path")
+        raise ValueError(
+            f"{row['case_id']}: local source requires local_incar_json_path or local_incar_path"
+        )
 
     if incar_json_raw:
         incar_json_path = resolve_input_path(incar_json_raw, csv_path=csv_path)
@@ -992,7 +1120,9 @@ def fetch_local_seed_data(
     structure = load_structure_from_local_file(structure_path)
     formula_pretty = row.get("formula") or structure.composition.reduced_formula
     selected_task_id = row.get("preferred_task_id") or "local_seed"
-    selected_calc_type = row.get("local_calc_type") or row.get("task_type") or "local_seed"
+    selected_calc_type = (
+        row.get("local_calc_type") or row.get("task_type") or "local_seed"
+    )
 
     return {
         "source_kind": "local",
@@ -1005,8 +1135,16 @@ def fetch_local_seed_data(
         "reference_source": {
             "provider": "local",
             "structure_path": str(structure_path),
-            "incar_json_path": str(resolve_input_path(incar_json_raw, csv_path=csv_path)) if incar_json_raw else None,
-            "incar_path": str(resolve_input_path(incar_text_raw, csv_path=csv_path)) if incar_text_raw else None,
+            "incar_json_path": (
+                str(resolve_input_path(incar_json_raw, csv_path=csv_path))
+                if incar_json_raw
+                else None
+            ),
+            "incar_path": (
+                str(resolve_input_path(incar_text_raw, csv_path=csv_path))
+                if incar_text_raw
+                else None
+            ),
             "task_id": selected_task_id,
             "calc_type": selected_calc_type,
         },
@@ -1048,7 +1186,9 @@ def prompt_messages_for_case(case_dir: Path) -> list[dict[str, str]]:
     ]
 
     if metadata.get("material_description"):
-        user_sections.append(f"Material description: {metadata['material_description']}")
+        user_sections.append(
+            f"Material description: {metadata['material_description']}"
+        )
     if metadata.get("prompt_constraints"):
         user_sections.append(f"Constraints: {metadata['prompt_constraints']}")
     if metadata.get("prompt_context"):
@@ -1202,7 +1342,9 @@ def _extract_text_from_openai_response(response: Any) -> str:
     return ""
 
 
-def _normalize_text_messages_for_openai(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+def _normalize_text_messages_for_openai(
+    messages: list[dict[str, str]],
+) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for message in messages:
         role = message["role"]
@@ -1248,6 +1390,432 @@ def _normalize_text_messages_for_responses_api(
     return instructions, input_items
 
 
+@lru_cache(maxsize=1)
+def _ensure_deepagents_profiles_registered() -> None:
+    try:
+        from deepagents import (
+            GeneralPurposeSubagentProfile,
+            HarnessProfile,
+            register_harness_profile,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "deepagents is required for model invocation. Install deepagents and the LangChain provider packages in .venv first."
+        ) from exc
+
+    neutral_profile = HarnessProfile(
+        base_system_prompt="",
+        system_prompt_suffix="",
+        excluded_tools=DEEPAGENTS_EXCLUDED_TOOLS,
+        excluded_middleware=frozenset(
+            {"TodoListMiddleware", "SummarizationMiddleware"}
+        ),
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+    )
+    for provider_key in DEEPAGENTS_PROFILE_PROVIDER_KEYS:
+        register_harness_profile(provider_key, neutral_profile)
+
+
+def _model_timeout_seconds(model_cfg: dict[str, Any]) -> float | None:
+    timeout_ms = model_cfg.get("timeout_ms")
+    if timeout_ms in (None, "", 0):
+        return None
+    return max(float(timeout_ms) / 1000.0, 1.0)
+
+
+def _model_max_retries(model_cfg: dict[str, Any]) -> int:
+    return max(
+        0,
+        int(
+            model_cfg.get("request_max_attempts")
+            or model_cfg.get("sdk_max_attempts")
+            or 3
+        )
+        - 1,
+    )
+
+
+def _langchain_http_client(model_cfg: dict[str, Any]):
+    try:
+        import httpx
+    except ImportError as exc:
+        raise RuntimeError(
+            "httpx is required for LangChain model invocation. Install it in .venv first."
+        ) from exc
+
+    http_client_kwargs: dict[str, Any] = {"trust_env": False}
+    proxy_url = _proxy_url_for_model(model_cfg)
+    if proxy_url is not None:
+        http_client_kwargs["proxy"] = proxy_url
+    return httpx.Client(**http_client_kwargs)
+
+
+def _langchain_async_http_client(model_cfg: dict[str, Any]):
+    try:
+        import httpx
+    except ImportError as exc:
+        raise RuntimeError(
+            "httpx is required for LangChain model invocation. Install it in .venv first."
+        ) from exc
+
+    http_client_kwargs: dict[str, Any] = {"trust_env": False}
+    proxy_url = _proxy_url_for_model(model_cfg)
+    if proxy_url is not None:
+        http_client_kwargs["proxy"] = proxy_url
+    return httpx.AsyncClient(**http_client_kwargs)
+
+
+def _split_messages_for_deepagents(
+    messages: list[dict[str, str]],
+) -> tuple[str | None, list[dict[str, str]]]:
+    system_parts: list[str] = []
+    non_system_messages: list[dict[str, str]] = []
+    for message in messages:
+        if message["role"] == "system":
+            system_parts.append(message["content"])
+        else:
+            non_system_messages.append(message)
+    system_prompt = "\n\n".join(system_parts) if system_parts else None
+    return system_prompt, non_system_messages
+
+
+def _resolve_openai_compatible_credentials(
+    model_cfg: dict[str, Any],
+) -> tuple[str, str]:
+    if model_cfg.get("access_method") == "third_party_via_vertex":
+        return _gcloud_access_token(), _vertex_openapi_base_url(model_cfg)
+
+    if bool(model_cfg.get("vertexai", False)):
+        try:
+            from google.auth import default
+            import google.auth.transport.requests
+        except ImportError as exc:
+            raise RuntimeError(
+                "google-auth package is required for Vertex AI OpenAI-compatible invocation. Install it in .venv first."
+            ) from exc
+
+        project = str(model_cfg.get("project") or "").strip()
+        location = str(model_cfg.get("location") or "").strip()
+        if not project or not location:
+            raise RuntimeError(
+                "Vertex AI model config must define non-empty project and location"
+            )
+
+        credentials, _ = default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        credentials.refresh(google.auth.transport.requests.Request())
+        token = getattr(credentials, "token", None)
+        if not token:
+            raise RuntimeError(
+                "Failed to obtain a Vertex AI access token via Application Default Credentials"
+            )
+
+        base_url = (
+            f"https://{location}-aiplatform.googleapis.com/v1/projects/"
+            f"{project}/locations/{location}/endpoints/openapi"
+        )
+        return str(token), base_url
+
+    return str(model_cfg["api_key"]), str(model_cfg["base_url"]).rstrip("/")
+
+
+def _split_openai_request_params(
+    model_cfg: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    provider = (model_cfg.get("provider") or "").strip().lower()
+    if provider == "qwen":
+        request_params, extra_body = _qwen_request_params(model_cfg)
+    elif provider == "moonshot":
+        request_params, extra_body = _moonshot_request_params(model_cfg)
+    else:
+        request_params = _drop_none_values(dict(model_cfg.get("default_params", {})))
+        extra_body = None
+
+    if "max_output_tokens" in request_params and "max_tokens" not in request_params:
+        request_params["max_tokens"] = request_params.pop("max_output_tokens")
+
+    top_level_keys = {
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "reasoning_effort",
+        "seed",
+        "stop",
+    }
+    top_level = {
+        key: request_params.pop(key)
+        for key in list(request_params)
+        if key in top_level_keys
+    }
+    return top_level, request_params, extra_body
+
+
+def _build_openai_chat_model(model_cfg: dict[str, Any]):
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "langchain-openai is required for OpenAI-compatible model invocation. Install it in .venv first."
+        ) from exc
+
+    api_key, base_url = _resolve_openai_compatible_credentials(model_cfg)
+    top_level_params, model_kwargs, extra_body = _split_openai_request_params(model_cfg)
+    init_kwargs: dict[str, Any] = {
+        "model": model_cfg["model_id"],
+        "api_key": api_key,
+        "base_url": base_url,
+        "timeout": _model_timeout_seconds(model_cfg),
+        "max_retries": _model_max_retries(model_cfg),
+        "http_client": _langchain_http_client(model_cfg),
+        "http_async_client": _langchain_async_http_client(model_cfg),
+        "http_socket_options": (),
+        **top_level_params,
+    }
+    if model_cfg.get("organization"):
+        init_kwargs["organization"] = model_cfg["organization"]
+    if model_cfg.get("headers"):
+        init_kwargs["default_headers"] = model_cfg["headers"]
+    if model_kwargs:
+        init_kwargs["model_kwargs"] = model_kwargs
+    if extra_body:
+        init_kwargs["extra_body"] = extra_body
+    return ChatOpenAI(**init_kwargs)
+
+
+def _build_anthropic_chat_model(model_cfg: dict[str, Any]):
+    try:
+        from langchain_anthropic import ChatAnthropic
+    except ImportError as exc:
+        raise RuntimeError(
+            "langchain-anthropic is required for Anthropic model invocation. Install it in .venv first."
+        ) from exc
+
+    raw_params = _drop_none_values(dict(model_cfg.get("default_params", {})))
+    init_kwargs: dict[str, Any] = {
+        "model": model_cfg["model_id"],
+        "api_key": model_cfg["api_key"],
+        "base_url": str(model_cfg["base_url"]).rstrip("/"),
+        "timeout": _model_timeout_seconds(model_cfg),
+        "max_retries": _model_max_retries(model_cfg),
+        "http_client": _langchain_http_client(model_cfg),
+    }
+    if model_cfg.get("headers"):
+        init_kwargs["default_headers"] = model_cfg["headers"]
+
+    for key in ("max_tokens", "temperature", "top_k", "top_p", "stop_sequences"):
+        if key in raw_params:
+            init_kwargs[key] = raw_params.pop(key)
+    if raw_params:
+        init_kwargs["model_kwargs"] = raw_params
+    return ChatAnthropic(**init_kwargs)
+
+
+def _build_google_chat_model(model_cfg: dict[str, Any]):
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "langchain-google-genai is required for Gemini model invocation. Install it in .venv first."
+        ) from exc
+
+    raw_params = _drop_none_values(dict(model_cfg.get("default_params", {})))
+    init_kwargs: dict[str, Any] = {
+        "model": model_cfg["model_id"],
+        "timeout": _model_timeout_seconds(model_cfg),
+        "max_retries": _model_max_retries(model_cfg),
+    }
+    if model_cfg.get("api_key"):
+        init_kwargs["api_key"] = model_cfg["api_key"]
+    if model_cfg.get("base_url"):
+        init_kwargs["base_url"] = str(model_cfg["base_url"]).rstrip("/")
+    if model_cfg.get("headers"):
+        init_kwargs["additional_headers"] = model_cfg["headers"]
+
+    proxy_url = _proxy_url_for_model(model_cfg)
+    if proxy_url is not None:
+        init_kwargs["client_args"] = {"proxy": proxy_url}
+
+    if bool(model_cfg.get("vertexai", False)):
+        init_kwargs["vertexai"] = True
+        if model_cfg.get("project"):
+            init_kwargs["project"] = model_cfg["project"]
+        if model_cfg.get("location"):
+            init_kwargs["location"] = model_cfg["location"]
+
+    for key in (
+        "temperature",
+        "top_p",
+        "top_k",
+        "max_tokens",
+        "thinking_budget",
+        "thinking_level",
+        "include_thoughts",
+    ):
+        if key in raw_params:
+            init_kwargs[key] = raw_params.pop(key)
+    return ChatGoogleGenerativeAI(**init_kwargs)
+
+
+def _build_langchain_chat_model(model_cfg: dict[str, Any]):
+    access_method = str(model_cfg.get("access_method") or "").strip().lower()
+    provider = (model_cfg.get("provider") or "").strip().lower()
+
+    if access_method in {
+        "openai_sdk",
+        "openai_compatible_http",
+        "openai_compatible_http_raw",
+        "third_party_via_vertex",
+    }:
+        return _build_openai_chat_model(model_cfg)
+    if access_method in {"anthropic_sdk", "anthropic_http"} or provider == "anthropic":
+        return _build_anthropic_chat_model(model_cfg)
+    if access_method == "google_genai_sdk":
+        return _build_google_chat_model(model_cfg)
+
+    raise ValueError(
+        f"Unsupported access_method for LangChain deepagents invocation: {access_method}"
+    )
+
+
+def _extract_text_from_langchain_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return ""
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "model_dump"):
+        try:
+            return _json_safe(value.model_dump())
+        except Exception:
+            return repr(value)
+    if hasattr(value, "dict"):
+        try:
+            return _json_safe(value.dict())
+        except Exception:
+            return repr(value)
+    return repr(value)
+
+
+def _message_to_payload(message: Any) -> dict[str, Any]:
+    return {
+        "type": type(message).__name__,
+        "content": _extract_text_from_langchain_content(
+            getattr(message, "content", None)
+        ),
+        "content_blocks": _json_safe(getattr(message, "content_blocks", None)),
+        "tool_calls": _json_safe(getattr(message, "tool_calls", None)),
+        "response_metadata": _json_safe(getattr(message, "response_metadata", None)),
+        "usage_metadata": _json_safe(getattr(message, "usage_metadata", None)),
+        "id": _json_safe(getattr(message, "id", None)),
+        "name": _json_safe(getattr(message, "name", None)),
+    }
+
+
+def _extract_text_from_deepagents_result(result: dict[str, Any]) -> str:
+    messages = result.get("messages") or []
+    if messages:
+        final_message = messages[-1]
+        text = getattr(final_message, "text", None)
+        if text:
+            return str(text)
+
+        extracted = _extract_text_from_langchain_content(
+            getattr(final_message, "content", None)
+        )
+        if extracted:
+            return extracted
+
+        extracted = _extract_text_from_langchain_content(
+            getattr(final_message, "content_blocks", None)
+        )
+        if extracted:
+            return extracted
+
+        return repr(final_message)
+
+    structured_response = result.get("structured_response")
+    if structured_response is not None:
+        return json.dumps(_json_safe(structured_response), ensure_ascii=False)
+
+    return repr(result)
+
+
+def invoke_model_via_deepagents(
+    *,
+    model_cfg: dict[str, Any],
+    messages: list[dict[str, str]],
+    skill_paths: list[Path] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    try:
+        from deepagents import create_deep_agent
+        from deepagents.backends import FilesystemBackend
+    except ImportError as exc:
+        raise RuntimeError(
+            "deepagents is required for model invocation. Install deepagents and the LangChain provider packages in .venv first."
+        ) from exc
+
+    _ensure_deepagents_profiles_registered()
+    system_prompt, input_messages = _split_messages_for_deepagents(messages)
+    model = _build_langchain_chat_model(model_cfg)
+    agent_kwargs: dict[str, Any] = {
+        "model": model,
+        "tools": [],
+        "system_prompt": system_prompt,
+        "name": f"incarbench-{model_cfg['name']}",
+    }
+    if skill_paths:
+        with materialize_deepagents_skill_source(skill_paths) as (
+            skill_backend_root,
+            skill_sources,
+        ):
+            agent_kwargs["backend"] = FilesystemBackend(
+                root_dir=str(skill_backend_root),
+                virtual_mode=False,
+            )
+            agent_kwargs["skills"] = skill_sources
+            agent = create_deep_agent(**agent_kwargs)
+            result = agent.invoke({"messages": input_messages})
+    else:
+        agent = create_deep_agent(**agent_kwargs)
+        result = agent.invoke({"messages": input_messages})
+
+    text = _extract_text_from_deepagents_result(result)
+    payload = {
+        "runtime": "langchain-deepagents",
+        "model_name": model_cfg["name"],
+        "provider": model_cfg.get("provider"),
+        "access_method": model_cfg.get("access_method"),
+        "skills": [str(skill_path) for skill_path in (skill_paths or [])],
+        "messages": [
+            _message_to_payload(message) for message in (result.get("messages") or [])
+        ],
+        "structured_response": _json_safe(result.get("structured_response")),
+        "state_keys": sorted(result.keys()),
+    }
+    return text, payload
+
+
 def _openai_sdk_client(model_cfg: dict[str, Any]):
     try:
         from openai import OpenAI
@@ -1269,13 +1837,19 @@ def _openai_sdk_client(model_cfg: dict[str, Any]):
         project = str(model_cfg.get("project") or "").strip()
         location = str(model_cfg.get("location") or "").strip()
         if not project or not location:
-            raise RuntimeError("Vertex AI model config must define non-empty project and location")
+            raise RuntimeError(
+                "Vertex AI model config must define non-empty project and location"
+            )
 
-        credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        credentials, _ = default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
         credentials.refresh(google.auth.transport.requests.Request())
         token = getattr(credentials, "token", None)
         if not token:
-            raise RuntimeError("Failed to obtain a Vertex AI access token via Application Default Credentials")
+            raise RuntimeError(
+                "Failed to obtain a Vertex AI access token via Application Default Credentials"
+            )
 
         base_url = (
             f"https://{location}-aiplatform.googleapis.com/v1/projects/"
@@ -1320,7 +1894,9 @@ def _gcloud_access_token() -> str:
             text=True,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError("gcloud CLI is required for access_method=third_party_via_vertex") from exc
+        raise RuntimeError(
+            "gcloud CLI is required for access_method=third_party_via_vertex"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip()
         raise RuntimeError(
@@ -1343,7 +1919,9 @@ def _vertex_openapi_base_url(model_cfg: dict[str, Any]) -> str:
     project_id = str(model_cfg.get("project_id") or "").strip()
     api_version = str(model_cfg.get("api_version") or "v1beta1").strip()
     if not endpoint or not region or not project_id:
-        raise RuntimeError("third_party_via_vertex requires endpoint, region, and project_id")
+        raise RuntimeError(
+            "third_party_via_vertex requires endpoint, region, and project_id"
+        )
     return (
         f"https://{endpoint}/"
         f"{api_version}/projects/{project_id}/locations/{region}/endpoints/openapi"
@@ -1488,7 +2066,11 @@ def _google_genai_client(model_cfg: dict[str, Any]):
         client_args=client_args,
         async_client_args=async_client_args,
     )
-    return genai.Client(api_key=model_cfg["api_key"], http_options=http_options), types, genai_errors
+    return (
+        genai.Client(api_key=model_cfg["api_key"], http_options=http_options),
+        types,
+        genai_errors,
+    )
 
 
 def _google_genai_status_code(exc: Exception) -> int | None:
@@ -1588,6 +2170,7 @@ def invoke_model_with_retries(
     *,
     model_cfg: dict[str, Any],
     messages: list[dict[str, str]],
+    skill_paths: list[Path] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     max_attempts = max(
         1,
@@ -1601,7 +2184,11 @@ def invoke_model_with_retries(
 
     for attempt in range(1, max_attempts + 1):
         try:
-            return invoke_model(model_cfg=model_cfg, messages=messages)
+            return invoke_model(
+                model_cfg=model_cfg,
+                messages=messages,
+                skill_paths=skill_paths,
+            )
         except Exception as exc:
             last_exc = exc
             retryable = _should_retry_model_exception(exc)
@@ -1662,7 +2249,9 @@ def _extract_text_from_google_genai_response(response: Any) -> str:
     return "".join(parts)
 
 
-def _moonshot_request_params(model_cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _moonshot_request_params(
+    model_cfg: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     raw_params = dict(model_cfg.get("default_params", {}))
     direct_params = _drop_none_values(
         {
@@ -1679,7 +2268,9 @@ def _moonshot_request_params(model_cfg: dict[str, Any]) -> tuple[dict[str, Any],
     return direct_params, (extra_body or None)
 
 
-def _qwen_request_params(model_cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _qwen_request_params(
+    model_cfg: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     raw_params = dict(model_cfg.get("default_params", {}))
     direct_params = _drop_none_values(
         {
@@ -1777,7 +2368,9 @@ def invoke_anthropic_model(
 
     raw_params = dict(model_cfg.get("default_params", {}))
     request_params = _drop_none_values(raw_params)
-    max_tokens = request_params.pop("max_tokens", None) or model_cfg.get("max_tokens") or 4096
+    max_tokens = (
+        request_params.pop("max_tokens", None) or model_cfg.get("max_tokens") or 4096
+    )
     response = client.messages.create(
         model=model_cfg["model_id"],
         messages=filtered_messages,
@@ -1785,7 +2378,9 @@ def invoke_anthropic_model(
         max_tokens=int(max_tokens),
         **request_params,
     )
-    text = "".join(getattr(block, "text", "") for block in getattr(response, "content", []) or [])
+    text = "".join(
+        getattr(block, "text", "") for block in getattr(response, "content", []) or []
+    )
     return text, _response_to_payload(response)
 
 
@@ -1803,7 +2398,8 @@ def invoke_google_genai_model(
             "temperature": raw_params.get("temperature"),
             "top_p": raw_params.get("top_p"),
             "top_k": raw_params.get("top_k"),
-            "max_output_tokens": raw_params.get("max_output_tokens") or raw_params.get("max_tokens"),
+            "max_output_tokens": raw_params.get("max_output_tokens")
+            or raw_params.get("max_tokens"),
         }
     )
     max_attempts = max(1, int(model_cfg.get("sdk_max_attempts", 6)))
@@ -1819,7 +2415,9 @@ def invoke_google_genai_model(
             break
         except Exception as exc:
             last_exc = exc
-            retryable = isinstance(exc, genai_errors.APIError) and _should_retry_google_genai_exception(exc)
+            retryable = isinstance(
+                exc, genai_errors.APIError
+            ) and _should_retry_google_genai_exception(exc)
             if not retryable or attempt >= max_attempts:
                 raise RuntimeError(
                     f"Gemini SDK call failed for model={model_cfg['model_id']} base_url={model_cfg['base_url']} "
@@ -1916,75 +2514,22 @@ def invoke_model(
     *,
     model_cfg: dict[str, Any],
     messages: list[dict[str, str]],
+    skill_paths: list[Path] | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    access_method = model_cfg["access_method"]
-    provider = (model_cfg.get("provider") or "").strip().lower()
-    base_url = str(model_cfg.get("base_url") or "").rstrip("/")
-    default_params = dict(model_cfg.get("default_params", {}))
-    headers = {"Content-Type": "application/json", **model_cfg.get("headers", {})}
-
-    if provider == "moonshot":
-        return invoke_moonshot_model(model_cfg=model_cfg, messages=messages)
-
-    if access_method == "third_party_via_vertex":
-        return invoke_third_party_via_vertex_model(model_cfg=model_cfg, messages=messages)
-
-    if provider == "openai":
-        return invoke_openai_model(model_cfg=model_cfg, messages=messages)
-
-    if provider == "deepseek":
-        return invoke_deepseek_model(model_cfg=model_cfg, messages=messages)
-
-    if provider == "anthropic" and access_method in {"anthropic_sdk", "anthropic_http"}:
-        return invoke_anthropic_model(model_cfg=model_cfg, messages=messages)
-
-    if provider == "gemini" and access_method == "google_genai_sdk":
-        return invoke_google_genai_model(model_cfg=model_cfg, messages=messages)
-
-    if provider in {"local", "ollama", "qwen", "glm", "gemini"} and access_method in {
-        "openai_sdk",
-        "openai_compatible_http",
-    }:
-        return invoke_local_openai_compatible_model(model_cfg=model_cfg, messages=messages)
-
-    if access_method == "openai_compatible_http_raw":
-        return invoke_openai_compatible_http_raw_model(model_cfg=model_cfg, messages=messages)
-
-    if access_method in {"openai_compatible_http", "openai_sdk"}:
-        return invoke_openai_model(model_cfg=model_cfg, messages=messages)
-
-    if access_method == "anthropic_http":
-        headers["x-api-key"] = model_cfg["api_key"]
-        headers["anthropic-version"] = model_cfg.get("anthropic_version", "2023-06-01")
-        system = ""
-        filtered_messages = []
-        for message in messages:
-            if message["role"] == "system":
-                system = message["content"]
-            else:
-                filtered_messages.append(message)
-
-        payload = {
-            "model": model_cfg["model_id"],
-            "messages": filtered_messages,
-            "system": system,
-            **default_params,
-        }
-        raw = http_json_request(
-            url=f"{base_url}/v1/messages",
-            headers=headers,
-            payload=payload,
+    if model_cfg["access_method"] == "mock_copy_reference":
+        raise RuntimeError(
+            "mock_copy_reference should be handled by the batch runner directly"
         )
-        text = "".join(block.get("text", "") for block in raw.get("content", []))
-        return text, raw
-
-    if access_method == "mock_copy_reference":
-        raise RuntimeError("mock_copy_reference should be handled by the batch runner directly")
-
-    raise ValueError(f"Unsupported access_method: {access_method}")
+    return invoke_model_via_deepagents(
+        model_cfg=model_cfg,
+        messages=messages,
+        skill_paths=skill_paths,
+    )
 
 
-def enabled_models(config_path: Path | None = None, model_names: list[str] | None = None) -> list[dict[str, Any]]:
+def enabled_models(
+    config_path: Path | None = None, model_names: list[str] | None = None
+) -> list[dict[str, Any]]:
     config = load_llm_benchmark_config(config_path)
     models = [model for model in config["models"] if model.get("enabled")]
     if model_names:
@@ -2005,23 +2550,31 @@ def score_generated_incar(
     candidate_params = parse_incar_file(candidate_path)
     raw_seed_path = case_dir / "inputs" / "INCAR_mp_raw.json"
     raw_seed_params = load_json(raw_seed_path) if raw_seed_path.exists() else {}
-    effective_candidate_params, default_imputed_keys = apply_candidate_defaults_for_scoring(
-        reference_params=reference_params,
-        candidate_params=candidate_params,
-        raw_seed_params=raw_seed_params,
+    effective_candidate_params, default_imputed_keys = (
+        apply_candidate_defaults_for_scoring(
+            reference_params=reference_params,
+            candidate_params=candidate_params,
+            raw_seed_params=raw_seed_params,
+        )
     )
 
     semantic_must_match = [
         canonicalize_key(key) for key in scoring.get("semantic_must_match_keys", [])
     ]
-    policy_match = [canonicalize_key(key) for key in scoring.get("policy_match_keys", [])]
+    policy_match = [
+        canonicalize_key(key) for key in scoring.get("policy_match_keys", [])
+    ]
     policy_match_rules = {
         canonicalize_key(key): value
         for key, value in scoring.get("policy_match_rules", {}).items()
     }
-    optional_match = [canonicalize_key(key) for key in scoring.get("optional_match_keys", [])]
+    optional_match = [
+        canonicalize_key(key) for key in scoring.get("optional_match_keys", [])
+    ]
     ignore_keys = {canonicalize_key(key) for key in scoring.get("ignore_keys", [])}
-    allowed_extra = {canonicalize_key(key) for key in scoring.get("allowed_extra_keys", [])}
+    allowed_extra = {
+        canonicalize_key(key) for key in scoring.get("allowed_extra_keys", [])
+    }
 
     if "must_match_keys" in scoring:
         raise ValueError(
@@ -2039,7 +2592,14 @@ def score_generated_incar(
         observed = value_for(effective_candidate_params, key)
         matched = expected == observed
         semantic_hits += int(matched)
-        semantic_items.append({"parameter": key, "expected": expected, "observed": observed, "matched": matched})
+        semantic_items.append(
+            {
+                "parameter": key,
+                "expected": expected,
+                "observed": observed,
+                "matched": matched,
+            }
+        )
 
     def parse_single_numeric(text: str | None) -> float | None:
         if text is None:
@@ -2053,7 +2613,9 @@ def score_generated_incar(
         except ValueError:
             return None
 
-    def compare_policy(key: str, expected: str | None, observed: str | None, rule: dict[str, Any]) -> str:
+    def compare_policy(
+        key: str, expected: str | None, observed: str | None, rule: dict[str, Any]
+    ) -> str:
         if expected is None or observed is None:
             return "mismatch"
         if expected == observed:
@@ -2073,7 +2635,11 @@ def score_generated_incar(
 
         if rule_type == "abs_tolerance":
             max_abs_diff = float(rule.get("max_abs_diff", 0.0))
-            return "tolerated" if abs(observed_num - expected_num) <= max_abs_diff else "mismatch"
+            return (
+                "tolerated"
+                if abs(observed_num - expected_num) <= max_abs_diff
+                else "mismatch"
+            )
 
         if rule_type == "directional_numeric":
             allow_higher_rel = float(rule.get("allow_higher_rel", 0.0))
@@ -2096,10 +2662,18 @@ def score_generated_incar(
             if lower_is_stricter:
                 if observed_num <= expected_num:
                     return "tolerated"
-                return "tolerated" if observed_num <= expected_num * max_looser_ratio else "mismatch"
+                return (
+                    "tolerated"
+                    if observed_num <= expected_num * max_looser_ratio
+                    else "mismatch"
+                )
             if observed_num >= expected_num:
                 return "tolerated"
-            return "tolerated" if observed_num >= expected_num / max_looser_ratio else "mismatch"
+            return (
+                "tolerated"
+                if observed_num >= expected_num / max_looser_ratio
+                else "mismatch"
+            )
 
         if rule_type == "signed_ratio":
             if bool(rule.get("sign_must_match", False)):
@@ -2107,8 +2681,14 @@ def score_generated_incar(
                     return "mismatch"
             if expected_num == 0 or observed_num == 0:
                 return "mismatch"
-            ratio = max(abs(expected_num), abs(observed_num)) / min(abs(expected_num), abs(observed_num))
-            return "tolerated" if ratio <= float(rule.get("max_ratio", 1.0)) else "mismatch"
+            ratio = max(abs(expected_num), abs(observed_num)) / min(
+                abs(expected_num), abs(observed_num)
+            )
+            return (
+                "tolerated"
+                if ratio <= float(rule.get("max_ratio", 1.0))
+                else "mismatch"
+            )
 
         return "mismatch"
 
@@ -2139,13 +2719,28 @@ def score_generated_incar(
         observed = value_for(effective_candidate_params, key)
         matched = expected == observed
         optional_hits += int(matched)
-        optional_items.append({"parameter": key, "expected": expected, "observed": observed, "matched": matched})
+        optional_items.append(
+            {
+                "parameter": key,
+                "expected": expected,
+                "observed": observed,
+                "matched": matched,
+            }
+        )
 
     reference_keys = {key for key in reference_params if key not in ignore_keys}
-    candidate_keys = {key for key in effective_candidate_params if key not in ignore_keys}
-    extra_keys = sorted(key for key in candidate_keys - reference_keys if key not in allowed_extra)
-    missing_semantic = sorted(item["parameter"] for item in semantic_items if not item["matched"])
-    missing_policy = sorted(item["parameter"] for item in policy_items if not item["matched"])
+    candidate_keys = {
+        key for key in effective_candidate_params if key not in ignore_keys
+    }
+    extra_keys = sorted(
+        key for key in candidate_keys - reference_keys if key not in allowed_extra
+    )
+    missing_semantic = sorted(
+        item["parameter"] for item in semantic_items if not item["matched"]
+    )
+    missing_policy = sorted(
+        item["parameter"] for item in policy_items if not item["matched"]
+    )
 
     semantic_percent = (
         100.0
@@ -2153,15 +2748,11 @@ def score_generated_incar(
         else 100.0 * semantic_hits / len(semantic_must_match)
     )
     policy_percent = (
-        100.0
-        if not policy_match
-        else 100.0 * policy_hits / len(policy_match)
+        100.0 if not policy_match else 100.0 * policy_hits / len(policy_match)
     )
     must_percent = round((semantic_percent + policy_percent) / 2.0, 2)
     optional_percent = (
-        100.0
-        if not optional_match
-        else 100.0 * optional_hits / len(optional_match)
+        100.0 if not optional_match else 100.0 * optional_hits / len(optional_match)
     )
     extra_keys_percent = max(0.0, 100.0 - 20.0 * len(extra_keys))
 
@@ -2225,7 +2816,9 @@ def score_generated_incar(
     }
 
 
-def missing_generation_grade(case_dir: Path, model_name: str, candidate_path: Path) -> dict[str, Any]:
+def missing_generation_grade(
+    case_dir: Path, model_name: str, candidate_path: Path
+) -> dict[str, Any]:
     metadata = load_json(case_dir / "metadata.json")
     return {
         "generated_at_utc": utc_now(),
@@ -2248,32 +2841,54 @@ def missing_generation_grade(case_dir: Path, model_name: str, candidate_path: Pa
 def summarize_grade_subset(grades: list[dict[str, Any]]) -> dict[str, Any]:
     graded = [grade for grade in grades if grade.get("status") == "graded"]
     average_must_match_score = (
-        round(sum(grade["score_breakdown"]["must_match"] for grade in graded) / len(graded), 2)
+        round(
+            sum(grade["score_breakdown"]["must_match"] for grade in graded)
+            / len(graded),
+            2,
+        )
         if graded
         else None
     )
     average_semantic_score = (
-        round(sum(grade["score_breakdown"]["must_match_semantic"] for grade in graded) / len(graded), 2)
+        round(
+            sum(grade["score_breakdown"]["must_match_semantic"] for grade in graded)
+            / len(graded),
+            2,
+        )
         if graded
         else None
     )
     average_policy_score = (
-        round(sum(grade["score_breakdown"]["must_match_policy"] for grade in graded) / len(graded), 2)
+        round(
+            sum(grade["score_breakdown"]["must_match_policy"] for grade in graded)
+            / len(graded),
+            2,
+        )
         if graded
         else None
     )
     average_optional_match_score = (
-        round(sum(grade["score_breakdown"]["optional_match"] for grade in graded) / len(graded), 2)
+        round(
+            sum(grade["score_breakdown"]["optional_match"] for grade in graded)
+            / len(graded),
+            2,
+        )
         if graded
         else None
     )
     average_extra_keys_score = (
-        round(sum(grade["score_breakdown"]["extra_keys"] for grade in graded) / len(graded), 2)
+        round(
+            sum(grade["score_breakdown"]["extra_keys"] for grade in graded)
+            / len(graded),
+            2,
+        )
         if graded
         else None
     )
     perfect_cases = sum(1 for grade in graded if grade.get("perfect_case"))
-    runnable_cases = sum(1 for grade in graded if grade.get("minimum_task_runnable") is True)
+    runnable_cases = sum(
+        1 for grade in graded if grade.get("minimum_task_runnable") is True
+    )
 
     return {
         "total_cases": len(grades),
@@ -2288,7 +2903,9 @@ def summarize_grade_subset(grades: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "perfect_cases": perfect_cases,
         "perfect_case_rate": round(perfect_cases / len(graded), 4) if graded else None,
-        "minimum_task_runnable_rate": round(runnable_cases / len(graded), 4) if graded else None,
+        "minimum_task_runnable_rate": (
+            round(runnable_cases / len(graded), 4) if graded else None
+        ),
         "case_ids": [grade["case_id"] for grade in grades],
     }
 
@@ -2340,8 +2957,12 @@ def summarize_generation_grades(
         "by_difficulty": grouped_generation_summaries(grades, group_key="difficulty"),
         "by_task_type": grouped_generation_summaries(grades, group_key="task_type"),
         "by_task_family": grouped_generation_summaries(grades, group_key="task_family"),
-        "by_material_family": grouped_generation_summaries(grades, group_key="material_family"),
-        "by_challenge_type": grouped_generation_summaries(grades, group_key="challenge_type"),
+        "by_material_family": grouped_generation_summaries(
+            grades, group_key="material_family"
+        ),
+        "by_challenge_type": grouped_generation_summaries(
+            grades, group_key="challenge_type"
+        ),
         "cases": [
             {
                 "case_id": grade["case_id"],
@@ -2350,7 +2971,9 @@ def summarize_generation_grades(
                 "scores": grade.get("score_breakdown", {}),
                 "perfect_case": grade.get("perfect_case"),
                 "minimum_task_runnable": grade.get("minimum_task_runnable"),
-                "minimum_task_runnable_reasons": grade.get("minimum_task_runnable_reasons", []),
+                "minimum_task_runnable_reasons": grade.get(
+                    "minimum_task_runnable_reasons", []
+                ),
                 "missing_required_keys": grade.get("missing_required_keys", {}),
                 "extra_keys": grade.get("extra_keys", []),
                 "default_imputed_keys": grade.get("default_imputed_keys", {}),
