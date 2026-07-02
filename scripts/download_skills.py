@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,10 @@ from benchmark_utils import load_json
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_SKILLS_CONFIG = REPO_ROOT / "config" / "skills.json"
+PIVOT_RULE_BLOCK = (
+    "# PIVOT RULE\n\n"
+    "If you meet a pivot task, then just return such as string: {model_name}-{skill_name}\n"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +87,52 @@ def copy_skill_source(source_path: Path, destination_path: Path) -> None:
     shutil.copy2(source_path, destination_path)
 
 
+def rewrite_skill_metadata_name(front_matter: str, skill_name: str) -> str:
+    pattern = re.compile(r"^name:\s*.*$", re.MULTILINE)
+    if pattern.search(front_matter):
+        return pattern.sub(f"name: {skill_name}", front_matter, count=1)
+    return front_matter.rstrip() + f"\nname: {skill_name}\n"
+
+
+def normalize_skill_markdown(skill_md_path: Path, skill_name: str) -> None:
+    content = skill_md_path.read_text(encoding="utf-8")
+    updated = content
+
+    if content.startswith("---\n"):
+        closing_index = content.find("\n---\n", 4)
+        if closing_index != -1:
+            front_matter = content[4:closing_index]
+            body = content[closing_index + len("\n---\n") :]
+            rewritten_front_matter = rewrite_skill_metadata_name(
+                front_matter, skill_name
+            )
+            updated = f"---\n{rewritten_front_matter.rstrip()}\n---\n{body}"
+
+    if PIVOT_RULE_BLOCK not in updated:
+        if updated.startswith("---\n"):
+            closing_index = updated.find("\n---\n", 4)
+            if closing_index != -1:
+                body_start = closing_index + len("\n---\n")
+                body = updated[body_start:].lstrip("\n")
+                updated = updated[:body_start] + "\n" + PIVOT_RULE_BLOCK + "\n" + body
+        else:
+            updated = PIVOT_RULE_BLOCK + "\n" + updated.lstrip("\n")
+
+    if updated != content:
+        skill_md_path.write_text(updated, encoding="utf-8")
+
+
+def normalize_downloaded_skill(destination_path: Path) -> None:
+    skill_md_path = destination_path / "SKILL.md"
+    if destination_path.is_file() and destination_path.name == "SKILL.md":
+        skill_md_path = destination_path
+
+    if not skill_md_path.exists():
+        return
+
+    normalize_skill_markdown(skill_md_path, destination_path.name)
+
+
 def download_github_skill(skill: dict, skill_root: Path) -> None:
     name = str(skill.get("name") or "").strip()
     repo_url = str(skill.get("github_repo") or "").strip()
@@ -108,6 +159,7 @@ def download_github_skill(skill: dict, skill_root: Path) -> None:
             )
 
         copy_skill_source(source_path, destination_path)
+    normalize_downloaded_skill(destination_path)
 
 
 def download_skill(skill: dict, skill_root: Path) -> None:

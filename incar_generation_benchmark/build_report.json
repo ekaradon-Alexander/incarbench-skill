@@ -1,8 +1,9 @@
 {
-  "generated_at_utc": "2026-07-01T03:33:03Z",
+  "generated_at_utc": "2026-07-02T02:42:54Z",
   "benchmark_root": "/Users/alexander/Workspace/incarbench-skill/incar_generation_benchmark",
-  "total_cases": 192,
+  "total_cases": 193,
   "built_cases": [
+    "P00_Pivot",
     "P01_Si_Static_SCF",
     "P02_GaAs_Line_Mode_Bands",
     "P03_Fe_Static_Magnetic",
@@ -200,7 +201,7 @@
   "skipped_cases": [],
   "failed_cases": [],
   "counts": {
-    "built": 192,
+    "built": 193,
     "synced": 0,
     "skipped": 0,
     "failed": 0

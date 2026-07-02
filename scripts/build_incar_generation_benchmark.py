@@ -20,6 +20,7 @@ from incar_generation_utils import (
     ensure_output_root,
     fetch_seed_data,
     incar_text_from_dict,
+    load_json,
     load_problem_csv,
     mentioned_scoring_keys_union,
     missing_generation_grade,
@@ -88,7 +89,14 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def case_is_complete(case_dir: Path) -> bool:
+def case_is_complete(case_dir: Path, source_kind: str) -> bool:
+    if source_kind == "pivot":
+        required_paths = (
+            case_dir / "metadata.json",
+            case_dir / "prompt_content.txt",
+        )
+        return all(path.exists() for path in required_paths)
+
     required_paths = (
         case_dir / "inputs" / "POSCAR",
         case_dir / "inputs" / "INCAR_reference",
@@ -194,12 +202,33 @@ def build_case(
 
     case_dir = output_root / "cases" / row["case_id"]
     write_text(case_dir / "inputs" / "POSCAR", to_poscar_string(seed["structure"]))
-    write_text(case_dir / "inputs" / "INCAR_reference", incar_text_from_dict(normalized))
+    write_text(
+        case_dir / "inputs" / "INCAR_reference", incar_text_from_dict(normalized)
+    )
     dump_json(case_dir / "inputs" / "INCAR_mp_raw.json", seed["raw_incar_params"])
     dump_json(case_dir / "metadata.json", metadata)
     dump_json(case_dir / "scoring.json", scoring)
     write_text(case_dir / "prompt_context.txt", metadata.get("prompt_context", ""))
     (case_dir / "model_outputs").mkdir(parents=True, exist_ok=True)
+
+
+def build_pivot_case(
+    *,
+    row: dict[str, str],
+    output_root: Path,
+) -> None:
+    metadata = build_case_metadata(
+        row=row,
+        source_kind="pivot",
+        source_reference={},
+        selected_task_id="",
+        selected_calc_type="",
+        formula_pretty=str(row.get("formula") or ""),
+    )
+
+    case_dir = output_root / "cases" / row["case_id"]
+    dump_json(case_dir / "metadata.json", metadata)
+    write_text(case_dir / "prompt_content.txt", row.get("prompt_context", ""))
 
 
 def sync_existing_case_definition(
@@ -234,10 +263,14 @@ def sync_existing_case_definition(
         source_reference=existing_metadata.get("reference_source") or {},
         selected_task_id=str(existing_metadata.get("selected_task_id") or ""),
         selected_calc_type=str(existing_metadata.get("selected_calc_type") or ""),
-        formula_pretty=str(existing_metadata.get("formula") or row.get("formula") or ""),
+        formula_pretty=str(
+            existing_metadata.get("formula") or row.get("formula") or ""
+        ),
     )
     scoring = build_scoring_payload(row, normalized)
-    write_text(case_dir / "inputs" / "INCAR_reference", incar_text_from_dict(normalized))
+    write_text(
+        case_dir / "inputs" / "INCAR_reference", incar_text_from_dict(normalized)
+    )
     dump_json(case_dir / "metadata.json", metadata)
     dump_json(case_dir / "scoring.json", scoring)
     write_text(case_dir / "prompt_context.txt", metadata.get("prompt_context", ""))
@@ -259,7 +292,9 @@ def discovered_model_names(benchmark_root: Path) -> list[str]:
 
 
 def rescore_existing_outputs(benchmark_root: Path) -> None:
-    case_dirs = sorted(path for path in (benchmark_root / "cases").iterdir() if path.is_dir())
+    case_dirs = sorted(
+        path for path in (benchmark_root / "cases").iterdir() if path.is_dir()
+    )
     model_names = discovered_model_names(benchmark_root)
     if not model_names:
         print("No discovered generation model outputs to rescore.", flush=True)
@@ -293,7 +328,9 @@ def rescore_existing_outputs(benchmark_root: Path) -> None:
             model_name=model_name,
             grades=grades,
         )
-        dump_json(benchmark_root / "leaderboards" / f"{model_name}_summary.json", summary)
+        dump_json(
+            benchmark_root / "leaderboards" / f"{model_name}_summary.json", summary
+        )
         print(f"Rescored generation model {model_name}", flush=True)
 
     summaries = load_summaries(benchmark_root / "leaderboards")
@@ -361,9 +398,19 @@ def main() -> None:
     api_key: str | None = None
 
     for row in rows:
+        source_kind = row_source_kind(row)
         case_dir = output_root / "cases" / row["case_id"]
         if args.sync_existing_definitions:
             try:
+                if source_kind == "pivot":
+                    build_pivot_case(
+                        row=row,
+                        output_root=output_root,
+                    )
+                    synced_case_ids.append(row["case_id"])
+                    print(f"Synced existing case {row['case_id']}", flush=True)
+                    continue
+
                 if not case_dir.is_dir():
                     raise FileNotFoundError(
                         f"{row['case_id']}: case directory not found under {output_root / 'cases'}"
@@ -391,27 +438,33 @@ def main() -> None:
             print(f"Synced existing case {row['case_id']}", flush=True)
             continue
 
-        if case_is_complete(case_dir) and not args.overwrite:
+        if case_is_complete(case_dir, source_kind) and not args.overwrite:
             skipped_case_ids.append(row["case_id"])
             print(f"Skip existing case {row['case_id']}", flush=True)
             continue
 
-        if api_key is None:
-            config = load_llm_benchmark_config(args.config)
-            api_key = config["materials_project"]["api_key"]
-
         try:
-            build_case(
-                row=row,
-                csv_path=args.csv,
-                api_key=api_key,
-                output_root=output_root,
-                global_keep_keys=global_keep_keys,
-            )
+            if source_kind == "pivot":
+                build_pivot_case(
+                    row=row,
+                    output_root=output_root,
+                )
+            else:
+                if api_key is None:
+                    config = load_llm_benchmark_config(args.config)
+                    api_key = config["materials_project"]["api_key"]
+
+                build_case(
+                    row=row,
+                    csv_path=args.csv,
+                    api_key=api_key,
+                    output_root=output_root,
+                    global_keep_keys=global_keep_keys,
+                )
         except Exception as exc:
             failure = {
                 "case_id": row["case_id"],
-                "source_kind": row_source_kind(row),
+                "source_kind": source_kind,
                 "mp_id": row.get("mp_id", ""),
                 "error_type": type(exc).__name__,
                 "error": str(exc),

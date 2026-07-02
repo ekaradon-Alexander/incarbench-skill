@@ -1,8 +1,21 @@
 {
   "version": "0.1",
   "benchmark_type": "incar_generation",
-  "total_cases": 192,
+  "total_cases": 193,
   "cases": [
+    {
+      "case_id": "P00_Pivot",
+      "source_kind": "pivot",
+      "mp_id": "",
+      "formula": "",
+      "task_type": "",
+      "task_family": "",
+      "material_family": "",
+      "challenge_type": "",
+      "difficulty": "",
+      "calc_type_pattern": "",
+      "normalization_profile": ""
+    },
     {
       "case_id": "P01_Si_Static_SCF",
       "source_kind": "mp",
