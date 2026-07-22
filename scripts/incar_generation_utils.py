@@ -508,6 +508,74 @@ def _extract_simple_default_value(text: str) -> str | None:
     return value if re.fullmatch(r"[A-Za-z][A-Za-z0-9.]*", value) else None
 
 
+def _mp_integer_to_alpha(raw_digits: str) -> str:
+    """Convert old-style integer ID (e.g. 2026) to new-style AlphaID (e.g. aaaaaczy).
+
+    Note. Remove the "mp-" prefix from `raw_digits` before calling this function.
+    """
+    value = int(raw_digits)
+
+    if value == 0:
+        return "a" * 8
+    
+    chars: list[str] = []
+    while value > 0:
+        value, remainder = divmod(value, 26)
+        chars.append(chr(ord("a") + remainder))
+    converted = "".join(reversed(chars))
+
+    if len(converted) < 8:
+        converted = ("a" * (8 - len(converted))) + converted
+
+    return converted
+
+
+def _mp_alpha_to_integer(raw_letters: str) -> str:
+    """Convert new-style AlphaID (e.g. aaaaaczy) to old-style integer ID (e.g. 2026).
+
+    Note. Remove the "mp-" prefix from `raw_letters` before calling this function.
+    """
+    value = 0
+
+    for char in raw_letters.lower():
+        digit = ord(char) - ord("a")
+        value = value * 26 + digit
+
+    return str(value)
+
+
+def _robust_search_for_mp_id(target_id: str, src: dict[str, Any]) -> Any:
+    """Search for MPID, e.g., 2026, mp-2026, aaaaaczy, and mp-aaaaaczy.
+    """
+    bare_id = target_id[3:] if target_id.startswith("mp-") else target_id
+
+    candidate_ids = {target_id}
+
+    if target_id.startswith("mp-"):
+        candidate_ids.add(bare_id)
+    else:
+        candidate_ids.add(f"mp-{bare_id}")
+
+    if bare_id.isdigit():
+        # Add new-style AlphaID to candidate list.
+        bare_alpha_id = _mp_integer_to_alpha(bare_id)
+        candidate_ids.add(bare_alpha_id)
+        candidate_ids.add(f"mp-{bare_alpha_id}")
+    elif bare_id.isalpha():
+        # Add old-style numerical ID to candidate list.
+        bare_numeric_id = _mp_alpha_to_integer(bare_id)
+        candidate_ids.add(bare_numeric_id)
+        candidate_ids.add(f"mp-{bare_numeric_id}")
+
+    for candidate in candidate_ids:
+        if candidate in src:
+            return src[candidate]
+        
+    raise KeyError(
+        f"Could not found MP ID {target_id} or its alias {candidate_ids} in source dict"
+    )
+
+
 def resolve_candidate_default_value(
     *,
     key: str,
@@ -930,14 +998,14 @@ def fetch_mp_seed_data(
                 "material_id": str(material_doc.material_id),
                 "formula_pretty": str(material_doc.formula_pretty),
                 "selected_task_id": selected_task_id,
-                "selected_calc_type": calc_types[selected_task_id],
+                "selected_calc_type": _robust_search_for_mp_id(selected_task_id, calc_types),
                 "structure": structure,
                 "raw_incar_params": raw_params,
                 "reference_source": {
                     "provider": "Materials Project",
                     "mp_id": row["mp_id"],
                     "task_id": selected_task_id,
-                    "calc_type": calc_types[selected_task_id],
+                    "calc_type": _robust_search_for_mp_id(selected_task_id, calc_types),
                 },
             }
         except Exception as exc:
